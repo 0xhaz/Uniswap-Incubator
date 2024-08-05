@@ -1,71 +1,36 @@
-// SPDX-License-Identifier: SEE LICENSE IN LICENSE
-pragma solidity ^0.8.25;
+// SPDX-License-Identifier: UNLICENSED
+pragma solidity ^0.8.0;
 
-/**
- * @title TakeProfitsHook
- * @notice An onchain orderbook directly integrated into Uniswap through a hook
- * @dev a take-profit is a type of order where the user wants to sell a token once it's price
- * increases to hit a certain price. For Example, if ETH is currently trading at 3,500 USDC
- * I can place a take-profit order that would represent something like "Sell 1 ETH when it's
- * trading at 4,000 USDC". This is useful for traders who want to automate their trading
- *
- * Mechanism Design:
- * - Ability to place an order
- * - Ability to cancel an order after placing (if not filled yet)
- * - Ability to withdraw/redeem tokens after order is filled
- *
- * Assume a pool of two tokens A and B and assume A is Token 0 and B is Token 1. Let's say current
- * tick of the pool is tick = 600, i.e A is more expensive than B
- *
- * There are two types of "take profit" orders possible here:
- * 1. Sell some amount of A when price of A goes up further
- * 2. Sell some amount of B when the price of B goes up
- *
- * For case(1) - a price increase of A is represented by the tick of the pool increasing, since A is Token 0
- * For case(2) - a price increase of B is represented by the tick of the pool decreasing, since B is Token 1
- *
- * ERC-1155 is used to issue "claim" tokens to the users proportional to how many input tokens they provided for their order,
- * and will use that to calculate how many output tokens they have available to claim
- *
- */
 import {BaseHook} from "v4-periphery/src/base/hooks/BaseHook.sol";
 import {ERC1155} from "@openzeppelin/contracts/token/ERC1155/ERC1155.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
 import {Hooks} from "v4-core/libraries/Hooks.sol";
+
 import {PoolId, PoolIdLibrary} from "v4-core/types/PoolId.sol";
 import {PoolKey} from "v4-core/types/PoolKey.sol";
+
 import {Currency, CurrencyLibrary} from "v4-core/types/Currency.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
+
 import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+
 import {TickMath} from "v4-core/libraries/TickMath.sol";
 import {BalanceDelta} from "v4-core/types/BalanceDelta.sol";
+
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
 
 contract TakeProfitsHook is BaseHook, ERC1155 {
-    // StateLibrary is new here and we haven't seen that before
-    // It's used to add helper functions to the PoolManager to read
-    // storage values
-    // In this case, we use it for accessing `currentTick` values
-    // from the pool manager
     using StateLibrary for IPoolManager;
-
-    // PoolIdLibrary used to convert PoolKeys to IDs
     using PoolIdLibrary for PoolKey;
-    // Used to represent Currency types and helper functions like `.isNative()`
     using CurrencyLibrary for Currency;
-    // Used for helpful math operations like `mulDiv`
     using FixedPointMathLib for uint256;
 
-    // mapping to store last known tick values for different pools
-    // also, when a pool is initialized, it's current tick is set for the first time
+    // Storage
     mapping(PoolId poolId => int24 lastTick) public lastTicks;
-    // Nested mapping to store pending orders based on position
-    // e.g pendingOrders[poolKey.toId()][tickToSellAt][zeroForOne] = inputTokensAmount
     mapping(PoolId poolId => mapping(int24 tickToSellAt => mapping(bool zeroForOne => uint256 inputAmount))) public
         pendingOrders;
-    // Mapping to redeem output tokens
+
     mapping(uint256 positionId => uint256 outputClaimable) public claimableOutputTokens;
-    // Mapping to store the position as a uint256 to use it as the Token ID for ERC-1155 claim tokens
     mapping(uint256 positionId => uint256 claimsSupply) public claimTokensSupply;
 
     // Errors
@@ -118,37 +83,38 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         // rabbit hole again
         if (sender == address(this)) return (this.afterSwap.selector, 0);
 
-        // should we try to find and execute orders? True initially
+        // Should we try to find and execute orders? True initially
         bool tryMore = true;
         int24 currentTick;
 
         while (tryMore) {
             // Try executing pending orders for this pool
+
             // `tryMore` is true if we successfully found and executed an order
             // which shifted the tick value
             // and therefore we need to look again if there are any pending orders
             // within the new tick range
 
             // `tickAfterExecutingOrder` is the tick value of the pool
-            // after executing the order
-            // if no order was executed, `tickAfterExecutingOrder` will
-            // be the same as `currentTick`, and `tryMore` will be false
+            // after executing an order
+            // if no order was executed, `tickAfterExecutingOrder` will be
+            // the same as current tick, and `tryMore` will be false
             (tryMore, currentTick) = tryExecutingOrders(key, !params.zeroForOne);
         }
 
-        // New last known tick for this pool is the `currentTick`
-        // after executing all orders
+        // New last known tick for this pool is the tick value
+        // after our orders are executed
         lastTicks[key.toId()] = currentTick;
         return (this.afterSwap.selector, 0);
     }
 
+    // Core Hook External Functions
     function placeOrder(PoolKey calldata key, int24 tickToSellAt, bool zeroForOne, uint256 inputAmount)
         external
         returns (int24)
     {
         // Get lower actually usable tick given `tickToSellAt`
         int24 tick = getLowerUsableTick(tickToSellAt, key.tickSpacing);
-
         // Create a pending order
         pendingOrders[key.toId()][tick][zeroForOne] += inputAmount;
 
@@ -166,13 +132,8 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         return tick;
     }
 
-    /**
-     * @notice Cancel an order if it hasn't been filled yet
-     * @dev Delete the pending order from the mapping, burn the claim tokens
-     * reduce the claim token total supply, and send their input tokens back to them
-     */
     function cancelOrder(PoolKey calldata key, int24 tickToSellAt, bool zeroForOne) external {
-        // Get lower actually usable tick given `tickToSellAt`
+        // Get lower actually usable tick for their order
         int24 tick = getLowerUsableTick(tickToSellAt, key.tickSpacing);
         uint256 positionId = getPositionId(key, tick, zeroForOne);
 
@@ -181,7 +142,7 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         if (positionTokens == 0) revert InvalidOrder();
 
         // Remove their `positionTokens` worth of position from pending orders
-        // NOTE: We don't want to zero this out directly becuase other users may have the same position
+        // NOTE: We don't want to zero this out directly because other users may have the same position
         pendingOrders[key.toId()][tick][zeroForOne] -= positionTokens;
         // Reduce claim token total supply and burn their share
         claimTokensSupply[positionId] -= positionTokens;
@@ -192,29 +153,6 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         token.transfer(msg.sender, positionTokens);
     }
 
-    /**
-     * @notice Redemption of output tokens after an order has been filled
-     * @dev What does the redeem output tokens back out:
-     * 1. We need to store the amount of output tokens that are redeemable a specific position
-     * 2. The user has claim tokens equivalent to their amount
-     * 3. We calculate their share of output tokens
-     * 4. Reduce that amount from the redeemable output tokens storage value
-     * 5. Burn their claim tokens
-     * 6. Transfer the output tokens to them
-     * @dev How do we calculate the user's share of output tokens:
-     * 1. positionTokens = amount of claimable input tokens they have. This is equal to how many input tokens they provided
-     * 2. totalClaimableForPosition = amount of output tokens we have from executing this position
-     * (not necessarily just for this user, but all users who placed this order)
-     * 3. totalInputAmountForPosition = total supply of input tokens for this tokens for this position placed across limit orders
-     * we are tracking (across all users)
-     *
-     * The user's output token amount then is a percentage of the total claimable output tokens that is
-     * proportional to their share of input tokens for this position
-     *
-     * User's % share of input amount = positionTokens / totalInputAmountForPosition
-     * User's share of output tokens = totalClaimableForPosition * (positionTokens / totalInputAmountForPosition)
-     * Which is equal to (positionTokens * totalClaimableForPosition) / totalInputAmountForPosition
-     */
     function redeem(PoolKey calldata key, int24 tickToSellAt, bool zeroForOne, uint256 inputAmountToClaimFor)
         external
     {
@@ -222,7 +160,8 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         int24 tick = getLowerUsableTick(tickToSellAt, key.tickSpacing);
         uint256 positionId = getPositionId(key, tick, zeroForOne);
 
-        // If no output tokens can be claimed yet i.e order hasn't been filled throw error
+        // If no output tokens can be claimed yet i.e. order hasn't been filled
+        // throw error
         if (claimableOutputTokens[positionId] == 0) revert NothingToClaim();
 
         // they must have claim tokens >= inputAmountToClaimFor
@@ -232,7 +171,7 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         uint256 totalClaimableForPosition = claimableOutputTokens[positionId];
         uint256 totalInputAmountForPosition = claimTokensSupply[positionId];
 
-        // outputAmount = (inputAmountToClaimFor * totalClaimableForPosition) / totalInputAmountForPosition
+        // outputAmount = (inputAmountToClaimFor * totalClaimableForPosition) / (totalInputAmountForPosition)
         uint256 outputAmount = inputAmountToClaimFor.mulDivDown(totalClaimableForPosition, totalInputAmountForPosition);
 
         // Reduce claimable output tokens amount
@@ -242,20 +181,12 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         claimTokensSupply[positionId] -= inputAmountToClaimFor;
         _burn(msg.sender, positionId, inputAmountToClaimFor);
 
-        // Transfer output tokens to user
+        // Transfer output tokens
         Currency token = zeroForOne ? key.currency1 : key.currency0;
         token.transfer(msg.sender, outputAmount);
     }
 
-    ////////////////////////// Internal Functions //////////////////////////
-
-    /**
-     * @notice This function will return two values - tryMore and tickAfterExecutingOrder
-     * if tryExecutingOrder is able to finnd an order to execute, it will execute that order and return tryMore = true
-     * along with updated current tick value. If no order is found, it will return tryMore = false
-     * @param key PoolKey of the pool
-     * @param executeZeroForOne Whether to execute a zeroForOne swap or not
-     */
+    // Internal Functions
     function tryExecutingOrders(PoolKey calldata key, bool executeZeroForOne)
         internal
         returns (bool tryMore, int24 newTick)
@@ -265,18 +196,23 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
 
         // Given `currentTick` and `lastTick`, 2 cases are possible:
 
-        // Case (1) - Tick has increased, i.e `currentTick` > `lastTick`
-        // or Case (2) - Tick has decreased, i.e `currentTick` < `lastTick`
+        // Case (1) - Tick has increased, i.e. `currentTick > lastTick`
+        // or, Case (2) - Tick has decreased, i.e. `currentTick < lastTick`
 
         // If tick increases => Token 0 price has increased
         // => We should check if we have orders looking to sell Token 0
-        // i.e orders with zeroForOne = true
-        // Tick has increased i.e people bought Token 0 by selling Token 1
-        // i.e Token 0 price has increased
-        // e.g in an ETH/USDC pool, people are buying ETH for USDC causing ETH price to increase
-        // We should check if we have orders looking to sell Token 0
+        // i.e. orders with zeroForOne = true
+
+        // ------------
+        // Case (1)
+        // ------------
+
+        // Tick has increased i.e. people bought Token 0 by selling Token 1
+        // i.e. Token 0 price has increased
+        // e.g. in an ETH/USDC pool, people are buying ETH for USDC causing ETH price to increase
+        // We should check if we have any orders looking to sell Token 0
         // at ticks `lastTick` to `currentTick`
-        // i.e check if we have any orders to sell ETH at the new price that ETH is at now because of the tick increase
+        // i.e. check if we have any orders to sell ETH at the new price that ETH is at now because of the increase
         if (currentTick > lastTick) {
             // Loop over all ticks from `lastTick` to `currentTick`
             // and execute orders that are looking to sell Token 0
@@ -288,20 +224,22 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
                     // Regardless of how many unique users placed the same order
                     executeOrder(key, tick, executeZeroForOne, inputAmount);
 
-                    // Return true becuase we may have more orders to execute
-                    // from lastTick to new currentTick
+                    // Return true because we may have more orders to execute
+                    // from lastTick to new current tick
                     // But we need to iterate again from scratch since our sale of ETH shifted the tick down
                     return (true, currentTick);
                 }
             }
         }
-        // TODO Case (2)
-        // Tick has gone down i.e people bought Token 1 by selling Token 0
-        // i.e Token 1 price has increased
-        // e.g in an ETH/USDC pool, people are buying USDC for ETH causing USDC price to increase
-        // We should check if we have orders looking to sell Token 1
+        // ------------
+        // Case (2)
+        // ------------
+        // Tick has gone down i.e. people bought Token 1 by selling Token 0
+        // i.e. Token 1 price has increased
+        // e.g. in an ETH/USDC pool, people are selling ETH for USDC causing ETH price to decrease (and USDC to increase)
+        // We should check if we have any orders looking to sell Token 1
         // at ticks `currentTick` to `lastTick`
-        // i.e check if we have any orders to sell USDC at the new price that USDC is at now because of the tick decrease
+        // i.e. check if we have any orders to buy ETH at the new price that ETH is at now because of the decrease
         else {
             for (int24 tick = lastTick; tick > currentTick; tick -= key.tickSpacing) {
                 uint256 inputAmount = pendingOrders[key.toId()][tick][executeZeroForOne];
@@ -312,14 +250,9 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
             }
         }
 
-        // If no orders were found to be executed, we don't need to try
-        // executing more orders - return false and the current tick
         return (false, currentTick);
     }
 
-    /**
-     * @notice Execute order of a given details on specific pending order to do the swap, settle balances, and update all mappings
-     */
     function executeOrder(PoolKey calldata key, int24 tick, bool zeroForOne, uint256 inputAmount) internal {
         // Do the actual swap and settle all balances
         BalanceDelta delta = swapAndSettleBalances(
@@ -342,14 +275,6 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         claimableOutputTokens[positionId] += outputAmount;
     }
 
-    /**
-     * @notice Execute an order in afterSwap
-     * @dev Assuming the order information is provided to us by a higher-level function (afterSwap)
-     * 1. Call poolManager.swap to conduct the actual swap. This will return a BalanceDelta
-     * 2. Settle all balances with the pool manager
-     * 3. Remove the swapped amount of input tokens from the pendingOrders mapping
-     * 4. Increase the amount of output tokens now claimable for this position in the claimableOutputTokens mapping
-     */
     function swapAndSettleBalances(PoolKey calldata key, IPoolManager.SwapParams memory params)
         internal
         returns (BalanceDelta)
@@ -367,7 +292,7 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
             }
 
             // Positive Value => Money coming into user's wallet
-            // Take from PoolManager
+            // Take from PM
             if (delta.amount1() > 0) {
                 _take(key.currency1, uint128(delta.amount1()));
             }
@@ -396,16 +321,13 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         poolManager.take(currency, address(this), amount);
     }
 
-    ////////////////////////// Helper Functions //////////////////////////
+    // Helper Functions
     function getPositionId(PoolKey calldata key, int24 tick, bool zeroForOne) public pure returns (uint256) {
         return uint256(keccak256(abi.encode(key.toId(), tick, zeroForOne)));
     }
 
-    /**
-     * @notice Getting the closest lower tick that is actually usable given an arbitrary tick value
-     */
     function getLowerUsableTick(int24 tick, int24 tickSpacing) private pure returns (int24) {
-        // E.g tickSpacing = 60, tick = -100
+        // E.g. tickSpacing = 60, tick = -100
         // closest usable tick rounded-down will be -120
 
         // intervals = -100/60 = -1 (integer division)
@@ -415,8 +337,8 @@ contract TakeProfitsHook is BaseHook, ERC1155 {
         // if tick > 0, `intervals` is fine as it is
         if (tick < 0 && tick % tickSpacing != 0) intervals--; // round towards negative infinity
 
-        // actual usable tick, then is intervals * tickSpacing
-        // i.e -2 * 60 = -120
+        // actual usable tick, then, is intervals * tickSpacing
+        // i.e. -2 * 60 = -120
         return intervals * tickSpacing;
     }
 }
