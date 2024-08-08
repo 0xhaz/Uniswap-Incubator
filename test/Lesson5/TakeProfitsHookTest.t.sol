@@ -252,7 +252,7 @@ contract TakeProfitsHookTest is Test, Deployers {
         // because the execution of that order would lower the tick
         // so even though tick increased beyond 60
         // the first order execution will lower it back down
-        // so order at tick 60 will not be executed.
+        // so order at tick 60 will not be executed
         uint256 tokensLeftToSell = hook.pendingOrders(key.toId(), 0, true);
         assertEq(tokensLeftToSell, 0);
 
