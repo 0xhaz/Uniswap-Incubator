@@ -76,5 +76,79 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
     using SafeCast for uint128;
     using StateLibrary for IPoolManager;
 
+    /// @notice Thrown when trying to interact with a non-initialized pool
+    error JIT__PoolNotInitialized();
+    error JIT__TickSpacingNotDefault();
+    error JIT__MinimumLiquidityNotMet();
+    error JIT__SenderIsNotHook();
+    error JIT__Expired();
+    error JIT__TooMuchSlippage();
+
+    int256 private constant MAX_INT = type(int256).max;
+    uint16 private constant MINIMUM_LIQUIDITY = 1000;
+
+    uint16 private constant LARGE_SWAP_THRESHOLD = 100; // 1%
+    uint16 private constant MAX_BP = 10000; // 100%
+
     constructor(IPoolManager _manager) BaseHook(_manager) {}
+
+    function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
+        return Hooks.Permissions({
+            beforeInitialize: false,
+            afterInitialize: false,
+            beforeAddLiquidity: true,
+            beforeRemoveLiquidity: false,
+            afterAddLiquidity: false,
+            afterRemoveLiquidity: false,
+            beforeSwap: true,
+            afterSwap: true,
+            beforeDonate: false,
+            afterDonate: false,
+            beforeSwapReturnDelta: false,
+            afterSwapReturnDelta: false,
+            afterAddLiquidityReturnDelta: false,
+            afterRemoveLiquidityReturnDelta: false
+        });
+    }
+
+    function beforeAddLiquidity(
+        address sender,
+        PoolKey calldata,
+        IPoolManager.ModifyLiquidityParams calldata,
+        bytes calldata
+    ) public override returns (bytes4) {
+        if (sender != address(this)) revert JIT__SenderIsNotHook();
+
+        return this.beforeAddLiquidity.selector;
+    }
+
+    function beforeSwap(address, PoolKey calldata, IPoolManager.SwapParams calldata, bytes calldata)
+        public
+        override
+        returns (bytes4, BeforeSwapDelta, uint24)
+    {
+        return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+    }
+
+    function afterSwap(address, PoolKey calldata, IPoolManager.SwapParams calldata, BalanceDelta delta, bytes calldata)
+        public
+        override
+        returns (bytes4, int128)
+    {
+        return (this.afterSwap.selector, 0);
+    }
+
+    //////////////////////// Helper Function ////////////////////////
+
+    /**
+     * @notice Adds liquidity to the pool just before a swap
+     * @param key The pool key
+     * @param params The liquidity parameters
+     * @param hookData Arbitrary data for usage in the hook
+     */
+    function addJITLiquidity(
+        PoolKey calldata key,
+        IPoolManager.ModifyLiquidityParams calldata params,
+        bytes calldata hookData
+    ) external payable {}
 }
