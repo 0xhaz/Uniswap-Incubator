@@ -11,7 +11,7 @@ import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapD
 
 /**
  * @title GasPriceHook
- * @notice Dynanmic Fees are an interesting concept because it allows pools to adjust their
+ * @notice Dynamic Fees are an interesting concept because it allows pools to adjust their
  * competitiveness with other pools for the same token pair by adjusting how much swap fees is being charged.
  * @notice Hooks can be designed in different ways, to favour LPs or to favour swappers
  * @notice This hook will be adjusting the fees charged depending on what the average gas price has been onchain

@@ -61,6 +61,7 @@ import {IERC20Metadata} from "@openzeppelin/contracts/interfaces/IERC20Metadata.
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
+import {LiquidityAmounts} from "@uniswap/v4-core/test/utils/LiquidityAmounts.sol";
 
 /**
  * @notice Mechanism Design
@@ -84,11 +85,20 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
     error JIT__Expired();
     error JIT__TooMuchSlippage();
 
+    uint128 private movingAverageGasPrice;
+    uint104 private movingAverageGasPriceCount;
+
+    /// @dev Min tick for full range with tick spacing of 60
+    int24 private constant MIN_TICK = -887220;
+    /// @dev Max tick for full range with tick spacing of 60
+    int24 private constant MAX_TICK = -MIN_TICK;
+
     int256 private constant MAX_INT = type(int256).max;
     uint16 private constant MINIMUM_LIQUIDITY = 1000;
 
     uint16 private constant LARGE_SWAP_THRESHOLD = 100; // 1%
     uint16 private constant MAX_BP = 10000; // 100%
+    uint24 private constant BASE_FEES = 5000; // 0.5%
 
     constructor(IPoolManager _manager) BaseHook(_manager) {}
 
@@ -122,11 +132,13 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
         return this.beforeAddLiquidity.selector;
     }
 
-    function beforeSwap(address, PoolKey calldata, IPoolManager.SwapParams calldata, bytes calldata)
+    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata, bytes calldata)
         public
         override
         returns (bytes4, BeforeSwapDelta, uint24)
     {
+        uint24 fee = getFee();
+        poolManager.updateDynamicLPFee(key, fee);
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
@@ -151,4 +163,143 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
         IPoolManager.ModifyLiquidityParams calldata params,
         bytes calldata hookData
     ) external payable {}
+
+    /**
+     * @notice Regular swaps are swaps that are not large enough to warrant JIT liquidity
+     * @param key The pool key
+     * @param params The swap parameters
+     * @param hookData Arbitrary data for usage in the hook
+     * @return The swap fee
+     */
+    function _regularSwap(PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata hookData)
+        private
+        returns (uint24)
+    {
+        return 0;
+    }
+
+    /**
+     * @notice Large swaps are swaps that are large enough to warrant JIT liquidity
+     * @param key The pool key
+     * @param params The swap parameters
+     * @param hookData Arbitrary data for usage in the hook
+     * @return The swap fee
+     */
+    function _largeSwap(PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata hookData)
+        private
+        returns (uint24)
+    {
+        return 0;
+    }
+
+    // Update our moving average gas price
+    function updateMovingAverage() internal {
+        uint128 gasPrice = uint128(tx.gasprice);
+
+        movingAverageGasPrice =
+            ((movingAverageGasPrice * movingAverageGasPriceCount) + gasPrice) / (movingAverageGasPriceCount + 1);
+
+        movingAverageGasPriceCount++;
+    }
+
+    function getFee() internal view returns (uint24) {
+        uint128 gasPrice = uint128(tx.gasprice);
+
+        /// @dev if gasPrice > movingAverageGasPrice * 1.
+        if (gasPrice > (movingAverageGasPrice * 11) / 10) {
+            return BASE_FEES / 2;
+        }
+
+        /// @dev if gasPrice < movingAverageGasPrice * 0.
+        if (gasPrice < (movingAverageGasPrice * 9) / 10) {
+            return BASE_FEES * 2;
+        }
+
+        return BASE_FEES;
+    }
+
+    function _rebalance(PoolKey memory key, int24 tickLower, int24 tickUpper) internal {
+        PoolId poolId = key.toId();
+        bytes memory ZERO_BYTES = "";
+
+        /**
+         * @notice Modifies the liquidity of a position in the pool
+         * @dev This function can be used to increase or decrease the liquidity of a position in the pool
+         * @param key The pool to modify liquidity in
+         * @param params The parameters for modifying the liquidity
+         * @param hookData The data to pass through to the add/removeLiquidity hooks
+         * @return callerDelta The balance delta of the caller of modifyLiquidity. This is the total of both principal and fee deltas
+         * @return feeDelta The balance delta of the fees generated in the liquidity range. Returned for informational purposes only
+         */
+        (BalanceDelta delta,) = poolManager.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: tickLower,
+                tickUpper: tickUpper,
+                liquidityDelta: -(poolManager.getLiquidity(poolId).toInt256()),
+                salt: 0
+            }),
+            ZERO_BYTES
+        );
+
+        /**
+         * @notice Computes the sqrt price from the given amounts of token0 and token1
+         * @param delta The delta of token0 and token1
+         * @return sqrtPriceX96 The sqrt price from the given amounts of token0 and token1
+         * @return liquidity The liquidity of the pool after the swap
+         */
+        uint160 newSqrtPriceX96 = (
+            FixedPointMathLib.sqrt(
+                FullMath.mulDiv(uint128(delta.amount1()), FixedPoint96.Q96, uint128(delta.amount0()))
+            ) * FixedPointMathLib.sqrt(FixedPoint96.Q96)
+        ).toUint160();
+
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolId);
+
+        /**
+         * @notice Swaps token0 for token1 or token1 for token0 in the pool
+         * @param key The pool to swap in
+         * @param params The parameters for the swap
+         * @param hookData The data to pass through to the swap hooks
+         * @return amount0 The amount of token0 swapped
+         */
+        poolManager.swap(
+            key,
+            IPoolManager.SwapParams({
+                zeroForOne: newSqrtPriceX96 < sqrtPriceX96,
+                amountSpecified: -MAX_INT - 1, // equivalent to type(int256).min
+                sqrtPriceLimitX96: newSqrtPriceX96
+            }),
+            ZERO_BYTES
+        );
+
+        /**
+         * @notice Computes the maximum amount of liquidity received for a given amount of token0, token1, the current
+         * pool prices and the prices at the tick boundaries
+         * @param sqrtPriceX96 A sqrt price representing the current pool prices
+         * @param sqrtPriceAX96 A sqrt price representing the first tick boundary
+         * @param sqrtPriceBX96 A sqrt price representing the second tick boundary
+         * @param amount0 The amount of token0 being sent in
+         * @param amount1 The amount of token1 being sent in
+         * @return liquidity The maximum amount of liquidity received
+         */
+        uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            newSqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(MIN_TICK),
+            TickMath.getSqrtPriceAtTick(MAX_TICK),
+            uint256(uint128(delta.amount0())),
+            uint256(uint128(delta.amount1()))
+        );
+
+        (BalanceDelta balanceDeltaAfter,) = poolManager.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: MIN_TICK,
+                tickUpper: MAX_TICK,
+                liquidityDelta: liquidity.toInt256(),
+                salt: 0
+            }),
+            ZERO_BYTES
+        );
+    }
 }
