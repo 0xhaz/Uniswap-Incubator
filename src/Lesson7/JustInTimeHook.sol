@@ -57,7 +57,6 @@ import {PoolKey} from "v4-core/types/PoolKey.sol";
 import {FullMath} from "v4-core/libraries/FullMath.sol";
 import {FixedPoint96} from "v4-core/libraries/FixedPoint96.sol";
 import {FixedPointMathLib} from "solmate/src/utils/FixedPointMathLib.sol";
-import {IERC20Metadata} from "@openzeppelin/contracts/interfaces/IERC20Metadata.sol";
 import {Strings} from "@openzeppelin/contracts/utils/Strings.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
@@ -89,9 +88,9 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
     uint104 private movingAverageGasPriceCount;
 
     /// @dev Min tick for full range with tick spacing of 60
-    int24 private constant MIN_TICK = -887220;
+    int24 private constant MIN_TICK = TickMath.MIN_TICK;
     /// @dev Max tick for full range with tick spacing of 60
-    int24 private constant MAX_TICK = -MIN_TICK;
+    int24 private constant MAX_TICK = TickMath.MAX_TICK;
 
     int256 private constant MAX_INT = type(int256).max;
     uint16 private constant MINIMUM_LIQUIDITY = 1000;
@@ -99,6 +98,14 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
     uint16 private constant LARGE_SWAP_THRESHOLD = 100; // 1%
     uint16 private constant MAX_BP = 10000; // 100%
     uint24 private constant BASE_FEES = 5000; // 0.5%
+
+    struct PoolInfo {
+        bool hasAccruedFees;
+        bool JIT;
+        address liquidityToken;
+    }
+
+    mapping(PoolId => PoolInfo) public poolInfo;
 
     constructor(IPoolManager _manager) BaseHook(_manager) {}
 
@@ -167,29 +174,44 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
     /**
      * @notice Regular swaps are swaps that are not large enough to warrant JIT liquidity
      * @param key The pool key
-     * @param params The swap parameters
-     * @param hookData Arbitrary data for usage in the hook
      * @return The swap fee
      */
-    function _regularSwap(PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata hookData)
-        private
-        returns (uint24)
-    {
-        return 0;
+    function _handleRegularSwap(
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata,
+        uint160 sqrtPriceX96,
+        uint128 liquidity
+    ) internal returns (bytes4, BeforeSwapDelta, uint24) {
+        // Logic for regular swaps
+        poolInfo[key.toId()].hasAccruedFees = true;
+        return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
     /**
      * @notice Large swaps are swaps that are large enough to warrant JIT liquidity
-     * @param key The pool key
-     * @param params The swap parameters
-     * @param hookData Arbitrary data for usage in the hook
-     * @return The swap fee
      */
-    function _largeSwap(PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata hookData)
-        private
-        returns (uint24)
-    {
-        return 0;
+    function _handleLargeSwap(
+        PoolKey calldata key,
+        IPoolManager.SwapParams calldata params,
+        uint160 sqrtPriceX96,
+        uint128 liquidity
+    ) private returns (bytes4, BeforeSwapDelta, uint24) {
+        // Logic for handling large swaps, including JIT-related actions
+        BalanceDelta delta;
+        bytes memory ZERO_BYTES = "";
+
+        (delta,) = poolManager.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: MIN_TICK,
+                tickUpper: MAX_TICK,
+                liquidityDelta: -(liquidity.toInt256()),
+                salt: 0
+            }),
+            ZERO_BYTES
+        );
+
+        return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
     // Update our moving average gas price
@@ -218,6 +240,9 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
         return BASE_FEES;
     }
 
+    /**
+     * @notice Check liquidity for large swap or regular swap
+     */
     function _rebalance(PoolKey memory key, int24 tickLower, int24 tickUpper) internal {
         PoolId poolId = key.toId();
         bytes memory ZERO_BYTES = "";
@@ -301,5 +326,51 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
             }),
             ZERO_BYTES
         );
+
+        // Donate any "dust" from the sqrtRatio change as fees
+        uint128 donateAmount0 = uint128(delta.amount0() + balanceDeltaAfter.amount0());
+        uint128 donateAmount1 = uint128(delta.amount1() + balanceDeltaAfter.amount1());
+
+        /**
+         * @notice Donate the given currency amounts to the pool with the given pool key
+         * @param key The key of the pool to donate to
+         * @param amount0 The amount of currency0 to donate
+         * @param amount1 The amount of currency1 to donate
+         * @param hookData Arbitrary data for usage in the hook
+         * @return BalanceDelta The delta of the caller after the donation
+         */
+        poolManager.donate(key, donateAmount0, donateAmount1, ZERO_BYTES);
+    }
+
+    function _nearestUsableTick(int24 tick_, uint24 tickSpacing) internal pure returns (int24 result) {
+        result = int24(_divRound(int128(tick_), int128(int24(tickSpacing)))) * int24(tickSpacing);
+
+        if (result < MIN_TICK) {
+            result += int24(tickSpacing);
+        } else if (result > MAX_TICK) {
+            result -= int24(tickSpacing);
+        }
+    }
+
+    function _divRound(int128 x, int128 y) internal pure returns (int128 result) {
+        int128 quot = _div(x, y);
+        result = quot >> 64;
+
+        // Check if remainder is greater than 0.5
+        if (quot % 2 ** 64 >= 0x8000000000000000) {
+            result += 1;
+        }
+    }
+
+    int128 private constant MIN_64x64 = -0x80000000000000000000000000000000; // -1
+    int128 private constant MAX_64x64 = 0x7FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFF; // 1
+
+    function _div(int128 x, int128 y) internal pure returns (int128) {
+        unchecked {
+            require(y != 0); // Division by zero
+            int256 result = (int256(x) << 64) / y;
+            require(result >= MIN_64x64 && result <= MAX_64x64); // Overflow
+            return int128(result);
+        }
     }
 }
