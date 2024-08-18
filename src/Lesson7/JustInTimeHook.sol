@@ -87,11 +87,6 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
     uint128 private movingAverageGasPrice;
     uint104 private movingAverageGasPriceCount;
 
-    /// @dev Min tick for full range with tick spacing of 60
-    int24 private constant MIN_TICK = TickMath.MIN_TICK;
-    /// @dev Max tick for full range with tick spacing of 60
-    int24 private constant MAX_TICK = TickMath.MAX_TICK;
-
     int256 private constant MAX_INT = type(int256).max;
     uint16 private constant MINIMUM_LIQUIDITY = 1000;
 
@@ -99,15 +94,50 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
     uint16 private constant MAX_BP = 10000; // 100%
     uint24 private constant BASE_FEES = 5000; // 0.5%
 
+    bytes32 internal constant hashSlotLowerTick = 0x12519fb38f6e5af830d800923f1b4e756174c53a1a5fbd5384706bef6bc3ded7; // keccak256("hashSlotLowerTick");
+    bytes32 internal constant hashSlotUpperTick = 0x334352b7316c99b5eb1590419dc5053fce159a8f4a83ecf755d907286540c544; // keccak256("hashSlotUpperTick");
+
     struct PoolInfo {
         bool hasAccruedFees;
         bool JIT;
         address liquidityToken;
     }
 
+    struct AddLiqudityParams {
+        Currency currency0;
+        Currency currency1;
+        uint24 fee;
+        uint256 amount0Desired;
+        uint256 amount1Desired;
+        uint256 amount0Min;
+        uint256 amount1Min;
+        address to;
+        uint256 deadline;
+    }
+
+    struct RemoveLiquidityParams {
+        Currency currency0;
+        Currency currency1;
+        uint24 fee;
+        uint256 liquidity;
+        uint256 deadline;
+    }
+
+    struct CallbackData {
+        address sender;
+        PoolKey key;
+        IPoolManager.ModifyLiquidityParams params;
+    }
+
     mapping(PoolId => PoolInfo) public poolInfo;
+    mapping(Currency => AddLiqudityParams) public currencyInLiquidity;
 
     constructor(IPoolManager _manager) BaseHook(_manager) {}
+
+    modifier ensure(uint256 deadline) {
+        if (deadline < block.timestamp) revert JIT__Expired();
+        _;
+    }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
         return Hooks.Permissions({
@@ -139,13 +169,128 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
         return this.beforeAddLiquidity.selector;
     }
 
-    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata, bytes calldata)
+    function beforeSwap(address, PoolKey calldata key, IPoolManager.SwapParams calldata params, bytes calldata)
         public
         override
         returns (bytes4, BeforeSwapDelta, uint24)
     {
         uint24 fee = getFee();
         poolManager.updateDynamicLPFee(key, fee);
+        bytes memory ZERO_BYTES = "";
+
+        (uint160 sqrtPriceX96, int24 tick,,) = poolManager.getSlot0(key.toId());
+        /**
+         * @notice Retrieves total liquidity for the given pool
+         * @dev Corresponds to pools[poolId].liquidity
+         * @param manager The pool manager
+         * @param poolId The pool to get liquidity for
+         * @return liquidity The total liquidity for the given pool
+         */
+        uint128 liquidity = StateLibrary.getLiquidity(poolManager, key.toId());
+
+        {
+            (uint256 amount0, uint256 amount1) = LiquidityAmounts.getAmountsForLiquidity(
+                sqrtPriceX96,
+                TickMath.getSqrtPriceAtTick(TickMath.MIN_TICK),
+                TickMath.getSqrtPriceAtTick(TickMath.MAX_TICK),
+                liquidity
+            );
+
+            if (params.zeroForOne) {
+                if (params.amountSpecified < 0) {
+                    poolInfo[key.toId()].JIT = ((-params.amountSpecified) * int256(uint256(MAX_BP)) / int256(amount0))
+                        > int256(uint256(LARGE_SWAP_THRESHOLD));
+                } else {
+                    poolInfo[key.toId()].JIT = (params.amountSpecified * int256(uint256(MAX_BP)) / int256(amount1))
+                        > int256(uint256(LARGE_SWAP_THRESHOLD));
+                }
+            } else {
+                if (params.amountSpecified < 0) {
+                    poolInfo[key.toId()].JIT = ((-params.amountSpecified) * int256(uint256(MAX_BP)) / int256(amount1))
+                        > int256(uint256(LARGE_SWAP_THRESHOLD));
+                } else {
+                    poolInfo[key.toId()].JIT = (params.amountSpecified * int256(uint256(MAX_BP)) / int256(amount0))
+                        > int256(uint256(LARGE_SWAP_THRESHOLD));
+                }
+            }
+        }
+
+        if (!poolInfo[key.toId()].JIT) {
+            poolInfo[key.toId()].hasAccruedFees = true;
+            return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+        }
+
+        (BalanceDelta balanceDelta,) = poolManager.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: TickMath.MIN_TICK,
+                tickUpper: TickMath.MAX_TICK,
+                liquidityDelta: -(liquidity.toInt256()),
+                salt: 0
+            }),
+            ZERO_BYTES
+        );
+
+        if (!poolInfo[key.toId()].hasAccruedFees) {
+            poolInfo[key.toId()].hasAccruedFees = true;
+        } else {
+            uint160 newSqrtPriceX96 = (
+                FixedPointMathLib.sqrt(
+                    FullMath.mulDiv(uint128(balanceDelta.amount1()), FixedPoint96.Q96, uint128(balanceDelta.amount0()))
+                ) * FixedPointMathLib.sqrt(FixedPoint96.Q96)
+            ).toUint160();
+
+            poolManager.swap(
+                key,
+                IPoolManager.SwapParams({
+                    zeroForOne: newSqrtPriceX96 < sqrtPriceX96,
+                    amountSpecified: -MAX_INT - 1, // equivalent to type(int256).min
+                    sqrtPriceLimitX96: newSqrtPriceX96
+                }),
+                ZERO_BYTES
+            );
+
+            sqrtPriceX96 = newSqrtPriceX96;
+        }
+
+        tick = _nearestUsableTick(tick, uint24(TickMath.MAX_TICK_SPACING));
+        int24 requiredLowerTick = tick - key.tickSpacing;
+        int24 requiredUpperTick = tick + key.tickSpacing;
+
+        assembly {
+            tstore(hashSlotLowerTick, requiredLowerTick)
+        }
+
+        assembly {
+            tstore(hashSlotUpperTick, requiredUpperTick)
+        }
+
+        liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(requiredLowerTick),
+            TickMath.getSqrtPriceAtTick(requiredUpperTick),
+            uint256(uint128(balanceDelta.amount0())),
+            uint256(uint128(balanceDelta.amount1()))
+        );
+
+        (BalanceDelta balanceDeltaAfter,) = poolManager.modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: requiredLowerTick,
+                tickUpper: requiredUpperTick,
+                liquidityDelta: liquidity.toInt256(),
+                salt: 0
+            }),
+            ZERO_BYTES
+        );
+
+        poolManager.donate(
+            key,
+            uint128(balanceDelta.amount0() + balanceDeltaAfter.amount0()),
+            uint128(balanceDelta.amount1() + balanceDeltaAfter.amount1()),
+            ZERO_BYTES
+        );
+
         return (this.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
     }
 
@@ -157,61 +302,58 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
         return (this.afterSwap.selector, 0);
     }
 
-    //////////////////////// Helper Function ////////////////////////
+    //////////////////////// External Functions ////////////////////////
 
-    /**
-     * @notice Adds liquidity to the pool just before a swap
-     * @param key The pool key
-     * @param params The liquidity parameters
-     * @param hookData Arbitrary data for usage in the hook
-     */
-    function addJITLiquidity(
-        PoolKey calldata key,
-        IPoolManager.ModifyLiquidityParams calldata params,
-        bytes calldata hookData
-    ) external payable {}
+    function addJITLiquidity(AddLiqudityParams calldata params)
+        external
+        payable
+        ensure(params.deadline)
+        returns (uint128 liquidity)
+    {
+        PoolKey memory key = PoolKey({
+            currency0: params.currency0,
+            currency1: params.currency1,
+            fee: params.fee,
+            tickSpacing: TickMath.MAX_TICK_SPACING,
+            hooks: IHooks(address(this))
+        });
 
-    /**
-     * @notice Regular swaps are swaps that are not large enough to warrant JIT liquidity
-     * @param key The pool key
-     * @return The swap fee
-     */
-    function _handleRegularSwap(
-        PoolKey calldata key,
-        IPoolManager.SwapParams calldata,
-        uint160 sqrtPriceX96,
-        uint128 liquidity
-    ) internal returns (bytes4, BeforeSwapDelta, uint24) {
-        // Logic for regular swaps
-        poolInfo[key.toId()].hasAccruedFees = true;
-        return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
-    }
+        PoolId poolId = key.toId();
+        (uint160 sqrtPriceX96,,,) = poolManager.getSlot0(poolId);
 
-    /**
-     * @notice Large swaps are swaps that are large enough to warrant JIT liquidity
-     */
-    function _handleLargeSwap(
-        PoolKey calldata key,
-        IPoolManager.SwapParams calldata params,
-        uint160 sqrtPriceX96,
-        uint128 liquidity
-    ) private returns (bytes4, BeforeSwapDelta, uint24) {
-        // Logic for handling large swaps, including JIT-related actions
-        BalanceDelta delta;
-        bytes memory ZERO_BYTES = "";
+        if (sqrtPriceX96 == 0) revert JIT__PoolNotInitialized();
 
-        (delta,) = poolManager.modifyLiquidity(
-            key,
-            IPoolManager.ModifyLiquidityParams({
-                tickLower: MIN_TICK,
-                tickUpper: MAX_TICK,
-                liquidityDelta: -(liquidity.toInt256()),
-                salt: 0
-            }),
-            ZERO_BYTES
+        PoolInfo storage info = poolInfo[poolId];
+        uint128 poolLiquidity = poolManager.getLiquidity(poolId);
+
+        liquidity = LiquidityAmounts.getLiquidityForAmounts(
+            sqrtPriceX96,
+            TickMath.getSqrtPriceAtTick(TickMath.MIN_TICK),
+            TickMath.getSqrtPriceAtTick(TickMath.MAX_TICK),
+            params.amount0Desired,
+            params.amount1Desired
         );
 
-        return (IHooks.beforeSwap.selector, BeforeSwapDeltaLibrary.ZERO_DELTA, 0);
+        if (poolLiquidity == 0 && liquidity <= MINIMUM_LIQUIDITY) revert JIT__MinimumLiquidityNotMet();
+
+        BalanceDelta addedDelta = modifyLiquidity(
+            key,
+            IPoolManager.ModifyLiquidityParams({
+                tickLower: TickMath.MIN_TICK,
+                tickUpper: TickMath.MAX_TICK,
+                liquidityDelta: liquidity.toInt256(),
+                salt: 0
+            })
+        );
+    }
+
+    //////////////////////// Helper Function ////////////////////////
+
+    function modifyLiquidity(PoolKey memory key, IPoolManager.ModifyLiquidityParams memory params)
+        internal
+        returns (BalanceDelta delta)
+    {
+        delta = abi.decode(poolManager.unlock(abi.encode(CallbackData(msg.sender, key, params))), (BalanceDelta));
     }
 
     // Update our moving average gas price
@@ -310,8 +452,8 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
          */
         uint128 liquidity = LiquidityAmounts.getLiquidityForAmounts(
             newSqrtPriceX96,
-            TickMath.getSqrtPriceAtTick(MIN_TICK),
-            TickMath.getSqrtPriceAtTick(MAX_TICK),
+            TickMath.getSqrtPriceAtTick(TickMath.MIN_TICK),
+            TickMath.getSqrtPriceAtTick(TickMath.MAX_TICK),
             uint256(uint128(delta.amount0())),
             uint256(uint128(delta.amount1()))
         );
@@ -319,8 +461,8 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
         (BalanceDelta balanceDeltaAfter,) = poolManager.modifyLiquidity(
             key,
             IPoolManager.ModifyLiquidityParams({
-                tickLower: MIN_TICK,
-                tickUpper: MAX_TICK,
+                tickLower: TickMath.MIN_TICK,
+                tickUpper: TickMath.MAX_TICK,
                 liquidityDelta: liquidity.toInt256(),
                 salt: 0
             }),
@@ -345,9 +487,9 @@ contract JustInTimeHook is IUnlockCallback, BaseHook {
     function _nearestUsableTick(int24 tick_, uint24 tickSpacing) internal pure returns (int24 result) {
         result = int24(_divRound(int128(tick_), int128(int24(tickSpacing)))) * int24(tickSpacing);
 
-        if (result < MIN_TICK) {
+        if (result < TickMath.MIN_TICK) {
             result += int24(tickSpacing);
-        } else if (result > MAX_TICK) {
+        } else if (result > TickMath.MAX_TICK) {
             result -= int24(tickSpacing);
         }
     }
