@@ -176,4 +176,76 @@ contract SrAmmHookV2 is BaseHook, SrAmmV2 {
         //console.logInt(diffSettledDelta);
         return (BaseHook.afterSwap.selector, 0);
     }
+
+    function getSrPoolSlot0(PoolKey memory key) public view returns (Slot0 bid, Slot0 offer) {
+        SrPool.SrPoolState storage srPoolState = _srPools[key.toId()];
+
+        return (srPoolState.bid, srPoolState.offer);
+    }
+
+    function afterInitialize(
+        address sender,
+        PoolKey calldata key,
+        uint160 sqrtPriceX96,
+        int24 tick,
+        bytes calldata hookData
+    ) external override returns (bytes4) {
+        _initializePool(key, sqrtPriceX96);
+        return BaseHook.afterInitialize.selector;
+    }
+
+    function getSrPoolLiquidity(PoolKey memory key) public view returns (uint128, uint128, uint128, uint128) {
+        SrPool.SrPoolState storage srPoolState = _srPools[key.toId()];
+
+        return (
+            srPoolState.bidLiquidity,
+            srPoolState.liquidity,
+            srPoolState.virtualBidLiquidity,
+            srPoolState.virtualOfferLiquidity
+        );
+    }
+
+    // Add liquidity through the hook
+    function addLiquidity(PoolKey memory key, IPoolManager.ModifyLiquidityParams memory params, bytes memory hookData)
+        public
+        payable
+        returns (BalanceDelta delta)
+    {
+        // handle user liquidity mapping
+        delta = abi.decode(
+            poolManager.unlock(abi.encode(CallbackData(msg.sender, key, params, hookData, false, true))), (BalanceDelta)
+        );
+    }
+
+    /// @dev Handle liquidity addition by taking tokens from the sender and claiming ERC6909 to the hook address
+    function unlockCallback(bytes calldata rawData) external override onlyByPoolManager returns (bytes memory) {
+        CallbackData memory data = abi.decode(rawData, (CallbackData));
+
+        int256 delta0 = -data.params.liquidityDelta;
+        int256 delta1 = -data.params.liquidityDelta;
+
+        console.log("custom liquidity");
+        console.logInt(delta0);
+        console.logInt(delta1);
+
+        data.key.currency0.settle(poolManager, data.sender, uint256(-delta0), data.settleUsingBurn);
+        data.key.currency1.settle(poolManager, data.sender, uint256(-delta1), data.settleUsingBurn);
+
+        data.key.currency0.take(poolManager, address(this), uint256(-delta0), data.takeClaims);
+        data.key.currency1.take(poolManager, address(this), uint256(-delta1), data.takeClaims);
+
+        srAmmAddLiquidity(data.key, data.params);
+        console.log("custom liquidity added");
+        return abi.encode(delta0, delta1);
+    }
+
+    function _fetchBalances(Currency currency, address user, address deltaHolder)
+        internal
+        view
+        returns (uint256 userBalance, uint256 poolBalance, int256 delta)
+    {
+        userBalance = currency.balanceOf(user);
+        poolBalance = currency.balanceOf(address(poolManager));
+        delta = poolManager.currencyDelta(deltaHolder, currency);
+    }
 }
