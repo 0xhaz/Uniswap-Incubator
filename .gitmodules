@@ -1,0 +1,3 @@
+[submodule "lib/brevis-contracts"]
+	path = lib/brevis-contracts
+	url = https://github.com/brevis-network/brevis-contracts

@@ -302,7 +302,7 @@ contract TWAMM is BaseHook, ITWAMM {
     {
         uint256 currentBalance = token.balanceOfSelf();
         amountTransferred = tokensOwed[token][msg.sender];
-        if (amountTransferred != 0 && amountRequested < amountTransferred) amountTransferred = amountRequested;
+        if (amountRequested != 0 && amountRequested < amountTransferred) amountTransferred = amountRequested;
         if (currentBalance < amountTransferred) amountTransferred = currentBalance; // to catch precision errors
         tokensOwed[token][msg.sender] -= amountTransferred;
         IERC20Minimal(Currency.unwrap(token)).safeTransfer(to, amountTransferred);
@@ -319,14 +319,14 @@ contract TWAMM is BaseHook, ITWAMM {
                 key.currency0.settle(poolManager, address(this), uint256(uint128(-delta.amount0())), false);
             }
             if (delta.amount1() > 0) {
-                key.currency1.settle(poolManager, address(this), uint256(uint128(delta.amount1())), false);
+                key.currency1.take(poolManager, address(this), uint256(uint128(delta.amount1())), false);
             }
         } else {
             if (delta.amount1() < 0) {
                 key.currency1.settle(poolManager, address(this), uint256(uint128(-delta.amount1())), false);
             }
             if (delta.amount0() > 0) {
-                key.currency0.settle(poolManager, address(this), uint256(uint128(delta.amount0())), false);
+                key.currency0.take(poolManager, address(this), uint256(uint128(delta.amount0())), false);
             }
         }
         return bytes("");
@@ -530,7 +530,7 @@ contract TWAMM is BaseHook, ITWAMM {
 
                 params.pool.liquidity = params.zeroForOne
                     ? params.pool.liquidity - uint128(liquidityNetAtTick)
-                    : params.pool.liquidity + uint128(liquidityNetAtTick);
+                    : params.pool.liquidity + uint128(-liquidityNetAtTick);
                 params.pool.sqrtPriceX96 = initializedSqrtPrice;
 
                 unchecked {
@@ -604,7 +604,7 @@ contract TWAMM is BaseHook, ITWAMM {
             (, int128 liquidityNet) = manager.getTickLiquidity(poolKey.toId(), params.initializedTick);
             if (initializedSqrtPrice < params.pool.sqrtPriceX96) liquidityNet = -liquidityNet;
             params.pool.liquidity = liquidityNet < 0
-                ? params.pool.liquidity - uint128(liquidityNet)
+                ? params.pool.liquidity - uint128(-liquidityNet)
                 : params.pool.liquidity + uint128(liquidityNet);
 
             params.pool.sqrtPriceX96 = initializedSqrtPrice;
