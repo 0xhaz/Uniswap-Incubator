@@ -185,7 +185,7 @@ contract TWAMM is BaseHook, ITWAMM {
         );
     }
 
-    /// @notice Submits a new long term order into the TWAMM
+    /// @notice Submits a new long term order into the TWAMM.
     /// @dev executeTWAMMOrders must be executed up to current timestamp before calling submitOrder
     /// @param orderKey The orderKey for the new order
     function _submitOrder(State storage self, OrderKey memory orderKey, uint256 sellRate)
