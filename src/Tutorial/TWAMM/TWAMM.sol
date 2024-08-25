@@ -167,7 +167,7 @@ contract TWAMM is BaseHook, ITWAMM {
 
         uint256 sellRate;
         unchecked {
-            // checks done in TWAMM library
+            // checks done in TWAMM library.
             uint256 duration = orderKey.expiration - block.timestamp;
             sellRate = amountIn / duration;
             orderId = _submitOrder(twamm, orderKey, sellRate);
