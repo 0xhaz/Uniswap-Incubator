@@ -22,6 +22,7 @@ import {CurrencySettler} from "@uniswap/v4-core/test/utils/CurrencySettler.sol";
 import {StateLibrary} from "v4-core/libraries/StateLibrary.sol";
 import {BeforeSwapDelta, BeforeSwapDeltaLibrary} from "v4-core/types/BeforeSwapDelta.sol";
 import {IPoolManager} from "v4-core/interfaces/IPoolManager.sol";
+import {console} from "forge-std/Console.sol";
 
 contract TWAMM is BaseHook, ITWAMM {
     using TransferHelper for IERC20Minimal;
@@ -55,6 +56,7 @@ contract TWAMM is BaseHook, ITWAMM {
 
     /// @inheritdoc ITWAMM
     uint256 public immutable expirationInterval;
+
     // twammStates[poolId] => Twamm.State
     mapping(PoolId => State) internal twammStates;
     // tokensOwed[token][owner] => amountOwed
@@ -62,6 +64,7 @@ contract TWAMM is BaseHook, ITWAMM {
 
     constructor(IPoolManager _manager, uint256 _expirationInterval) BaseHook(_manager) {
         expirationInterval = _expirationInterval;
+        console.log("TWAMM deployed with expiration interval: %s", _expirationInterval);
     }
 
     function getHookPermissions() public pure override returns (Hooks.Permissions memory) {
@@ -198,6 +201,8 @@ contract TWAMM is BaseHook, ITWAMM {
         if (sellRate == 0) revert SellRateCannotBeZero();
         if (orderKey.expiration % expirationInterval != 0) revert ExpirationNotOnInterval(orderKey.expiration);
 
+        console.log("////////////////// Internal Submit Order //////////////////");
+
         orderId = _orderId(orderKey);
         if (self.orders[orderId].sellRate != 0) revert OrderAlreadyExists(orderKey);
 
@@ -205,10 +210,18 @@ contract TWAMM is BaseHook, ITWAMM {
 
         unchecked {
             orderPool.sellRateCurrent += sellRate;
+            console.log("Pool Current Sale Rate", orderPool.sellRateCurrent);
             orderPool.sellRateEndingAtInterval[orderKey.expiration] += sellRate;
+            console.log("Pool Sale Rate Ending At Time", orderPool.sellRateEndingAtInterval[orderKey.expiration]);
         }
 
+        console.log("Reward Factor Last: ", orderPool.earningsFactorCurrent);
+        console.log("Sell Rate: ", sellRate);
+
         self.orders[orderId] = Order({sellRate: sellRate, earningsFactorLast: orderPool.earningsFactorCurrent});
+
+        console.log("Reward Factor Last: ", orderPool.earningsFactorCurrent);
+        console.log("Sell Rate: ", sellRate);
     }
 
     /// @inheritdoc ITWAMM
@@ -354,6 +367,8 @@ contract TWAMM is BaseHook, ITWAMM {
             return (false, 0);
         }
 
+        console.log("////////////////// Execute Orders //////////////////");
+
         uint160 initialSqrtPriceX96 = pool.sqrtPriceX96;
         uint256 prevTimestamp = self.lastVirtualOrderTimestamp;
         uint256 nextExpirationTimestamp = prevTimestamp + (expirationInterval - (prevTimestamp % expirationInterval));
@@ -368,6 +383,7 @@ contract TWAMM is BaseHook, ITWAMM {
                         || orderPool1For0.sellRateEndingAtInterval[nextExpirationTimestamp] > 0
                 ) {
                     if (orderPool0For1.sellRateCurrent != 0 && orderPool1For0.sellRateCurrent != 0) {
+                        console.log("////////////////// Advance To New Time //////////////////");
                         pool = _advanceToNewTimestamp(
                             self,
                             poolManager,
@@ -380,6 +396,7 @@ contract TWAMM is BaseHook, ITWAMM {
                             )
                         );
                     } else {
+                        console.log("////////////////// Advance Time for Single Pool //////////////////");
                         pool = _advanceTimestampForSinglePoolSell(
                             self,
                             manager,
@@ -402,6 +419,7 @@ contract TWAMM is BaseHook, ITWAMM {
 
             if (prevTimestamp < block.timestamp && _hasOutstandingOrders(self)) {
                 if (orderPool0For1.sellRateCurrent != 0 && orderPool1For0.sellRateCurrent != 0) {
+                    console.log("////////////////// Advance To New Time 2 //////////////////");
                     pool = _advanceToNewTimestamp(
                         self,
                         manager,
@@ -409,6 +427,7 @@ contract TWAMM is BaseHook, ITWAMM {
                         AdvanceParams(expirationInterval, block.timestamp, block.timestamp - prevTimestamp, pool)
                     );
                 } else {
+                    console.log("////////////////// Advance Time for Single Pool 2 //////////////////");
                     pool = _advanceTimestampForSinglePoolSell(
                         self,
                         poolManager,
@@ -444,6 +463,8 @@ contract TWAMM is BaseHook, ITWAMM {
     ) private returns (PoolParamsOnExecute memory) {
         uint160 finalSqrtPriceX96;
         uint256 secondsElapsedX96 = params.secondsElapsed * FixedPoint96.Q96;
+
+        console.log("////////////////// Advance To New Time 3 //////////////////");
 
         OrderPool.State storage orderPool0For1 = self.orderPool0For1;
         OrderPool.State storage orderPool1For0 = self.orderPool1For0;
@@ -508,6 +529,8 @@ contract TWAMM is BaseHook, ITWAMM {
         uint256 sellRateCurrent = orderPool.sellRateCurrent;
         uint256 amountSelling = sellRateCurrent * params.secondsElapsed;
         uint256 totalEarnings;
+
+        console.log("////////////////// Advance Time For Single Pool 3 //////////////////");
 
         while (true) {
             uint160 finalSqrtPriceX96 = SqrtPriceMath.getNextSqrtPriceFromInput(
@@ -576,6 +599,7 @@ contract TWAMM is BaseHook, ITWAMM {
         TickCrossingParams memory params
     ) private returns (PoolParamsOnExecute memory, uint256) {
         uint160 initializedSqrtPrice = params.initializedTick.getSqrtPriceAtTick();
+        console.log("////////////////// Advance Time Through Tick Crossing //////////////////");
 
         uint256 secondsUntilCrossingX96 = TwammMath.calculateTimeBetweenTicks(
             params.pool.liquidity,
@@ -619,6 +643,7 @@ contract TWAMM is BaseHook, ITWAMM {
         PoolKey memory poolKey,
         uint160 nextSqrtPriceX96
     ) internal view returns (bool crossingInitializedTick, int24 nextTickInit) {
+        console.log("////////////////// isCrossingTick //////////////////");
         // use current price as a starting point for nextTickInit
         nextTickInit = pool.sqrtPriceX96.getTickAtSqrtPrice();
         int24 targetTick = nextSqrtPriceX96.getTickAtSqrtPrice();
@@ -628,6 +653,7 @@ contract TWAMM is BaseHook, ITWAMM {
         // NextTickInit returns the furthest tick within one word if no tick within that word is initialized
         // so we must keep iterating if we haven't reached a tick further than our target tick
         while (!nextTickInitFurtherThanTarget) {
+            console.log("////////////////// !NextTickIsFurtherThanTarget //////////////////");
             unchecked {
                 if (searchingLeft) nextTickInit -= 1;
             }
@@ -649,6 +675,7 @@ contract TWAMM is BaseHook, ITWAMM {
     }
 
     function _hasOutstandingOrders(State storage self) internal view returns (bool) {
+        console.log("////////////////// Has Outstanding Orders //////////////////");
         return self.orderPool0For1.sellRateCurrent != 0 || self.orderPool1For0.sellRateCurrent != 0;
     }
 }

@@ -10,4 +10,8 @@ via_ir = true
 ffi = true
 #unchecked_cheatcode_artifacts = true
 
+[rpc_endpoints]
+sepolia = "https://rpc.sepolia.org/"
+op_sepolia = "https://sepolia.optimism.io"
+
 # See more config options https://github.com/foundry-rs/foundry/blob/master/crates/config/README.md#all-options

@@ -25,6 +25,9 @@ library TwammMath {
     // (TickMath.MAX_SQRT_RATIO - 1).fromUInt()
     bytes16 internal constant MAX_SQRT_RATIO_BYTES = 0x409efffb12c7dfa3f8d4a0c91092bb2a;
 
+    uint24 public constant STATIC_FEE_MASK = 0x7FFFFF;
+    uint24 public constant DYNAMIC_FEE_FLAG = 0x800000;
+
     struct PriceParamsBytes16 {
         bytes16 sqrtSellRatio;
         bytes16 sqrtSellRate;
@@ -39,6 +42,12 @@ library TwammMath {
         uint128 liquidity;
         uint256 sellRateCurrent0;
         uint256 sellRateCurrent1;
+    }
+
+    struct FeeParams {
+        bytes16 sqrtSellRatio; // Ratio of sell orders (or trades)
+        bytes16 tradeImpact; // Impact of the trade relative to liquidity
+        bytes16 directionFactor; // Multiplier for directional sensitivity
     }
 
     function getNewSqrtPriceX96(ExecutionUpdateParams memory params) internal pure returns (uint160 newSqrtPriceX96) {
