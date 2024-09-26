@@ -1,3 +1,4 @@
+chainlink-brownie-contracts/=lib/chainlink-brownie-contracts/contracts/src/v0.6/vendor/@arbitrum/nitro-contracts/src/
 @ensdomains/=lib/v4-periphery/lib/v4-core/node_modules/@ensdomains/
 @openzeppelin/=lib/v4-periphery/lib/v4-core/lib/openzeppelin-contracts/
 @openzeppelin/contracts/=lib/v4-periphery/lib/v4-core/lib/openzeppelin-contracts/contracts/
@@ -34,4 +35,6 @@ prb-test/=lib/optimism/packages/contracts-bedrock/lib/automate/lib/prb-test/src/
 safe-contracts/=lib/optimism/packages/contracts-bedrock/lib/safe-contracts/contracts/
 solady/=lib/optimism/packages/contracts-bedrock/lib/solady/
 automate/=lib/optimism/packages/contracts-bedrock/lib/automate/contracts/
+@chainlink/=lib/chainlink-brownie-contracts/
+
 
