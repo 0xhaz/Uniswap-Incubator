@@ -116,7 +116,7 @@ contract RugGuard is BaseHook, Ownable, ReentrancyGuard, AutomationCompatibleInt
      * @param poolId The ID of the pool
      * @param result The result of the off-chain computation
      */
-    event OffChainComputationProcessed(PoolId indexed poolId, uint256 result);
+    event OffChainComputationProcessed(PoolId indexed poolId, bytes result);
 
     /**
      * @notice Emitted when a proof is verified
@@ -415,6 +415,127 @@ contract RugGuard is BaseHook, Ownable, ReentrancyGuard, AutomationCompatibleInt
                 poolInfo[poolId].lastPrice = newPrice;
             }
         }
+    }
+
+    /**
+     * @notice Sets the liquidity change threshold for a specific pool
+     * @param key The pool key containing pool information
+     * @param newThreshold The new liquidity change threshold
+     */
+    function setLiquidityChangeThreshold(PoolKey calldata key, uint256 newThreshold) external onlyOwner {
+        PoolId poolId = key.toId();
+        poolInfo[poolId].liquidityChangeThreshold = newThreshold;
+
+        emit ThresholdUpdated(poolId, newThreshold);
+    }
+
+    /**
+     * @notice Checks if upkeep is needed for a specific pool (Chainlink Automation Compatible)
+     * @param checkData The encoded pool ID to check
+     * @return upkeepNeeded Boolean indicating if upkeep is needed
+     * @return performData The same data passed in, to be used in the performUpkeep function
+     */
+    function checkUpkeep(bytes calldata checkData)
+        external
+        view
+        override
+        returns (bool upkeepNeeded, bytes memory performData)
+    {
+        PoolId poolId = abi.decode(checkData, (PoolId));
+        PoolInfo storage pool = poolInfo[poolId];
+
+        upkeepNeeded = (block.timestamp >= pool.lastVolumeUpdateTimestamp + 1 days) || (pool.riskScore > 80);
+        performData = checkData;
+    }
+
+    /**
+     * @notice Performs upkeep for a specific pool (Chainlink Automation Compatible)
+     * @param performData The encoded pool ID to perform upkeep
+     */
+    function performUpkeep(bytes calldata performData) external override {
+        PoolId poolId = abi.decode(performData, (PoolId));
+        PoolInfo storage pool = poolInfo[poolId];
+
+        if (block.timestamp >= pool.lastVolumeUpdateTimestamp + 1 days) {
+            pool.totalVolume24h = 0;
+            pool.lastVolumeUpdateTimestamp = block.timestamp;
+        }
+
+        if (pool.riskScore > 80) {
+            emit PotentialRugPullDetected(poolId, pool.riskScore);
+        }
+    }
+
+    /**
+     * @notice Verifies a Brevis zkSNARK proof and updates pool information if valid
+     * @param _proof The zkSNARK proof to verify
+     * @param _publicInputs The public inputs to the proof verification
+     */
+    function verifyBrevisProof(bytes calldata _proof, uint256[] calldata _publicInputs) external {
+        bool verified = brevisVerifier.verifyProof(_proof, _publicInputs);
+        PoolId poolId = PoolId.wrap(bytes32(_publicInputs[0]));
+        emit ProofVerified(poolId, verified);
+
+        if (verified) {
+            // Update pool information based on verified proof
+            PoolInfo storage pool = poolInfo[poolId];
+            pool.riskScore = _publicInputs[1];
+            emit RiskScoreUpdated(poolId, pool.riskScore);
+        }
+    }
+
+    /**
+     * @notice Sets the Chainlink price feed for a specific token
+     * @param token The address of the token
+     * @param priceFeed The address of the Chainlink price feed
+     */
+    function setPriceFeed(address token, address priceFeed) external onlyOwner {
+        priceFeeds[token] = AggregatorV3Interface(priceFeed);
+    }
+
+    /**
+     * @notice Sets the EigenLayer strategy contract
+     * @param _eigenLayerStrategy The address of the EigenLayer strategy contract
+     */
+    function setEigenLayerStrategy(IEigenLayerStrategy _eigenLayerStrategy) external onlyOwner {
+        eigenLayerStrategy = _eigenLayerStrategy;
+    }
+
+    /**
+     * @notice Sets the BrevisVerifier contract
+     * @param _brevisVerifier The address of the BrevisVerifier contract
+     */
+    function setBrevisVerifier(IBrevisVerifier _brevisVerifier) external onlyOwner {
+        brevisVerifier = _brevisVerifier;
+    }
+
+    /**
+     * @notice Withdraws a specific ERC20 token from the contract
+     * @param token The address of the token to withdraw
+     * @param amount The amount of tokens to withdraw
+     */
+    function withdrawToken(address token, uint256 amount) external onlyOwner {
+        IERC20(token).safeTransfer(msg.sender, amount);
+    }
+
+    /**
+     * @notice Receives Ether sent to the contract
+     */
+    receive() external payable {}
+
+    /**
+     * @notice Fallback function to receive Ether sent to the contract
+     */
+    fallback() external payable {}
+
+    /**
+     * @notice Withdraws all Ether from the contract to the owner
+     */
+    function withdrawEther() external onlyOwner {
+        uint256 balance = address(this).balance;
+        require(balance > 0, "RugGuard: No Ether to withdraw");
+        (bool success,) = payable(owner()).call{value: balance}("");
+        require(success, "RugGuard: Ether withdrawal failed");
     }
 
     /**
